@@ -717,7 +717,9 @@ class Model:
         logits = cast(tuple[FloatTensor], outputs.scores)[0]
 
         # The returned tensor has shape (prompt, token).
-        return F.log_softmax(logits, dim=-1)
+        # Upcast to float32 before log_softmax to avoid -inf from underflow
+        # in low-precision dtypes (FP8, float16, bfloat16).
+        return F.log_softmax(logits.float(), dim=-1)
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
         logprobs = []
