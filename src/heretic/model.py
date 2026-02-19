@@ -166,9 +166,17 @@ class Model:
         # but this is harmless as we only abliterate the modules we target in `abliterate()`,
         # leaving the others at their default (identity) state.
         # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
+        #
+        # We resolve target module names by matching module identities from the model tree,
+        # because the component labels in get_layer_modules (e.g. "mlp.down_proj") may differ
+        # from the actual registered module names (e.g. "w2" in MiniMax-M2.5 MoE experts).
+        all_modules = {id(m): name.split(".")[-1] for name, m in self.model.named_modules()}
+        target_modules = list({
+            all_modules[id(module)]
+            for modules in self.get_layer_modules(0).values()
+            for module in modules
+            if id(module) in all_modules
+        })
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -267,24 +275,24 @@ class Model:
         else:
             # Non-quantized model - can merge directly.
             # FP8 base weights don't support in-place addition (+=) needed by merge,
-            # so upcast them to bfloat16 first, merge, then cast back.
-            fp8_params = {}
-            for name, module in self.model.named_modules():
+            # so dequantize them to bfloat16 first (applying block-wise scale factors),
+            # then merge. The merged model is kept in bfloat16 because the original
+            # FP8 scale factors are invalidated by the LoRA delta.
+            for _, module in self.model.named_modules():
                 if hasattr(module, "weight") and not isinstance(module, Linear):
                     w = module.weight
                     if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                        fp8_params[name] = w.dtype
-                        module.weight.data = w.data.to(torch.bfloat16)
+                        W = w.data.to(torch.bfloat16)
+                        if hasattr(module, "weight_scale_inv") and module.weight_scale_inv is not None:
+                            bs_r, bs_c = module.block_size
+                            scale = module.weight_scale_inv
+                            scale = scale.repeat_interleave(bs_r, dim=0)[: W.shape[0]]
+                            scale = scale.repeat_interleave(bs_c, dim=1)[:, : W.shape[1]]
+                            W = W * scale.to(dtype=W.dtype, device=W.device)
+                        module.weight.data = W
 
             print("* Merging LoRA adapters into base model...")
             merged_model = self.model.merge_and_unload()
-
-            # Cast merged weights back to their original FP8 dtype.
-            if fp8_params:
-                for name, module in merged_model.named_modules():
-                    if name in fp8_params and hasattr(module, "weight"):
-                        module.weight.data = module.weight.data.to(fp8_params[name])
-
             # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
             self.needs_reload = True
@@ -472,12 +480,11 @@ class Model:
                     # FIXME: This cast is valid only under the assumption that the original
                     #        module wrapped by the LoRA adapter has a weight attribute.
                     #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
+                    base_module = module.base_layer
+                    base_weight = cast(Tensor, base_module.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
+                    if quant_state is not None:
                         # 4-bit quantization.
                         # This cast is always valid. Type inference fails here because the
                         # bnb.functional module is not found by ty for some reason.
@@ -488,6 +495,17 @@ class Model:
                                 quant_state,
                             ).to(torch.float32),
                         )
+                    elif hasattr(base_module, "weight_scale_inv") and base_module.weight_scale_inv is not None:
+                        # FP8 block-wise quantization (e.g. transformers FP8Linear).
+                        # Apply per-block scale factors to recover the true weight values.
+                        W = base_weight.to(torch.float32)
+                        bs_r, bs_c = base_module.block_size
+                        scale = base_module.weight_scale_inv
+                        scale = scale.repeat_interleave(bs_r, dim=0)[: W.shape[0]]
+                        scale = scale.repeat_interleave(bs_c, dim=1)[:, : W.shape[1]]
+                        W = W * scale.to(W.device)
+                    else:
+                        W = base_weight.to(torch.float32)
 
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
