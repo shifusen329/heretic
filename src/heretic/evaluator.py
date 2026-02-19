@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import math
+
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -101,6 +103,10 @@ class Evaluator:
             reduction="batchmean",
             log_target=True,
         ).item()
+        # Aggressive abliteration can destabilize the model, producing NaN logits.
+        # Treat NaN KL as infinitely bad so Optuna avoids these parameter regions.
+        if math.isnan(kl_divergence):
+            kl_divergence = float("inf")
         print(f"  * KL divergence: [bold]{kl_divergence:.4f}[/]")
 
         print("  * Counting model refusals...")
